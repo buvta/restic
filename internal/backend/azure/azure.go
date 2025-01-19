@@ -37,6 +37,8 @@ type Backend struct {
 	prefix       string
 	listMaxItems int
 	layout.Layout
+
+	accessTier blob.AccessTier
 }
 
 const saveLargeSize = 256 * 1024 * 1024
@@ -60,6 +62,11 @@ func open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 	} else {
 		endpointSuffix = "core.windows.net"
 	}
+
+	if cfg.AccountName == "" {
+		return nil, errors.Fatalf("unable to open Azure backend: Account name ($AZURE_ACCOUNT_NAME) is empty")
+	}
+
 	url := fmt.Sprintf("https://%s.blob.%s/%s", cfg.AccountName, endpointSuffix, cfg.Container)
 	opts := &azContainer.ClientOptions{
 		ClientOptions: azcore.ClientOptions{
@@ -102,10 +109,20 @@ func open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 			return nil, errors.Wrap(err, "NewAccountSASClientFromEndpointToken")
 		}
 	} else {
-		debug.Log(" - using DefaultAzureCredential")
-		cred, err := azidentity.NewDefaultAzureCredential(nil)
-		if err != nil {
-			return nil, errors.Wrap(err, "NewDefaultAzureCredential")
+		var cred azcore.TokenCredential
+
+		if cfg.ForceCliCredential {
+			debug.Log(" - using AzureCLICredential")
+			cred, err = azidentity.NewAzureCLICredential(nil)
+			if err != nil {
+				return nil, errors.Wrap(err, "NewAzureCLICredential")
+			}
+		} else {
+			debug.Log(" - using DefaultAzureCredential")
+			cred, err = azidentity.NewDefaultAzureCredential(nil)
+			if err != nil {
+				return nil, errors.Wrap(err, "NewDefaultAzureCredential")
+			}
 		}
 
 		client, err = azContainer.NewClient(url, cred, opts)
@@ -114,18 +131,31 @@ func open(cfg Config, rt http.RoundTripper) (*Backend, error) {
 		}
 	}
 
+	var accessTier blob.AccessTier
+	// if the access tier is not supported, then we will not set the access tier; during the upload process,
+	// the value will be inferred from the default configured on the storage account.
+	for _, tier := range supportedAccessTiers() {
+		if strings.EqualFold(string(tier), cfg.AccessTier) {
+			accessTier = tier
+			debug.Log(" - using access tier %v", accessTier)
+			break
+		}
+	}
+
 	be := &Backend{
-		container:   client,
-		cfg:         cfg,
-		connections: cfg.Connections,
-		Layout: &layout.DefaultLayout{
-			Path: cfg.Prefix,
-			Join: path.Join,
-		},
+		container:    client,
+		cfg:          cfg,
+		connections:  cfg.Connections,
+		Layout:       layout.NewDefaultLayout(cfg.Prefix, path.Join),
 		listMaxItems: defaultListMaxItems,
+		accessTier:   accessTier,
 	}
 
 	return be, nil
+}
+
+func supportedAccessTiers() []blob.AccessTier {
+	return []blob.AccessTier{blob.AccessTierHot, blob.AccessTierCool, blob.AccessTierCold, blob.AccessTierArchive}
 }
 
 // Open opens the Azure backend at specified container.
@@ -150,8 +180,14 @@ func Create(ctx context.Context, cfg Config, rt http.RoundTripper) (*Backend, er
 		if err != nil {
 			return nil, errors.Wrap(err, "container.Create")
 		}
+	} else if err != nil && bloberror.HasCode(err, bloberror.AuthorizationFailure) {
+		// We ignore this Auth. Failure, as the failure is related to the type
+		// of SAS/SAT, not an actual real failure. If the token is invalid, we
+		// fail later on anyway.
+		// For details see Issue #4004.
+		debug.Log("Ignoring AuthorizationFailure when calling GetProperties")
 	} else if err != nil {
-		return be, err
+		return be, errors.Wrap(err, "container.GetProperties")
 	}
 
 	return be, nil
@@ -167,18 +203,22 @@ func (be *Backend) IsNotExist(err error) bool {
 	return bloberror.HasCode(err, bloberror.BlobNotFound)
 }
 
-// Join combines path components with slashes.
-func (be *Backend) Join(p ...string) string {
-	return path.Join(p...)
+func (be *Backend) IsPermanentError(err error) bool {
+	if be.IsNotExist(err) {
+		return true
+	}
+
+	var aerr *azcore.ResponseError
+	if errors.As(err, &aerr) {
+		if aerr.StatusCode == http.StatusRequestedRangeNotSatisfiable || aerr.StatusCode == http.StatusUnauthorized || aerr.StatusCode == http.StatusForbidden {
+			return true
+		}
+	}
+	return false
 }
 
 func (be *Backend) Connections() uint {
 	return be.connections
-}
-
-// Location returns this backend's location (the container name).
-func (be *Backend) Location() string {
-	return be.Join(be.cfg.AccountName, be.cfg.Prefix)
 }
 
 // Hasher may return a hash function for calculating a content hash for the backend
@@ -196,25 +236,39 @@ func (be *Backend) Path() string {
 	return be.prefix
 }
 
+// useAccessTier determines whether to apply the configured access tier to a given file.
+// For archive access tier, only data files are stored using that class; metadata
+// must remain instantly accessible.
+func (be *Backend) useAccessTier(h backend.Handle) bool {
+	notArchiveClass := !strings.EqualFold(be.cfg.AccessTier, "archive")
+	isDataFile := h.Type == backend.PackFile && !h.IsMetadata
+	return isDataFile || notArchiveClass
+}
+
 // Save stores data in the backend at the handle.
 func (be *Backend) Save(ctx context.Context, h backend.Handle, rd backend.RewindReader) error {
 	objName := be.Filename(h)
 
 	debug.Log("InsertObject(%v, %v)", be.cfg.AccountName, objName)
 
+	var accessTier blob.AccessTier
+	if be.useAccessTier(h) {
+		accessTier = be.accessTier
+	}
+
 	var err error
 	if rd.Length() < saveLargeSize {
 		// if it's smaller than 256miB, then just create the file directly from the reader
-		err = be.saveSmall(ctx, objName, rd)
+		err = be.saveSmall(ctx, objName, rd, accessTier)
 	} else {
 		// otherwise use the more complicated method
-		err = be.saveLarge(ctx, objName, rd)
+		err = be.saveLarge(ctx, objName, rd, accessTier)
 	}
 
 	return err
 }
 
-func (be *Backend) saveSmall(ctx context.Context, objName string, rd backend.RewindReader) error {
+func (be *Backend) saveSmall(ctx context.Context, objName string, rd backend.RewindReader, accessTier blob.AccessTier) error {
 	blockBlobClient := be.container.NewBlockBlobClient(objName)
 
 	// upload it as a new "block", use the base64 hash for the ID
@@ -235,11 +289,13 @@ func (be *Backend) saveSmall(ctx context.Context, objName string, rd backend.Rew
 	}
 
 	blocks := []string{id}
-	_, err = blockBlobClient.CommitBlockList(ctx, blocks, &blockblob.CommitBlockListOptions{})
+	_, err = blockBlobClient.CommitBlockList(ctx, blocks, &blockblob.CommitBlockListOptions{
+		Tier: &accessTier,
+	})
 	return errors.Wrap(err, "CommitBlockList")
 }
 
-func (be *Backend) saveLarge(ctx context.Context, objName string, rd backend.RewindReader) error {
+func (be *Backend) saveLarge(ctx context.Context, objName string, rd backend.RewindReader, accessTier blob.AccessTier) error {
 	blockBlobClient := be.container.NewBlockBlobClient(objName)
 
 	buf := make([]byte, 100*1024*1024)
@@ -286,7 +342,9 @@ func (be *Backend) saveLarge(ctx context.Context, objName string, rd backend.Rew
 		return errors.Errorf("wrote %d bytes instead of the expected %d bytes", uploadedBytes, rd.Length())
 	}
 
-	_, err := blockBlobClient.CommitBlockList(ctx, blocks, &blockblob.CommitBlockListOptions{})
+	_, err := blockBlobClient.CommitBlockList(ctx, blocks, &blockblob.CommitBlockListOptions{
+		Tier: &accessTier,
+	})
 
 	debug.Log("uploaded %d parts: %v", len(blocks), blocks)
 	return errors.Wrap(err, "CommitBlockList")
@@ -311,6 +369,11 @@ func (be *Backend) openReader(ctx context.Context, h backend.Handle, length int,
 
 	if err != nil {
 		return nil, err
+	}
+
+	if length > 0 && (resp.ContentLength == nil || *resp.ContentLength != int64(length)) {
+		_ = resp.Body.Close()
+		return nil, &azcore.ResponseError{ErrorCode: "restic-file-too-short", StatusCode: http.StatusRequestedRangeNotSatisfiable}
 	}
 
 	return resp.Body, err

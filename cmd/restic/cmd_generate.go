@@ -1,6 +1,8 @@
 package main
 
 import (
+	"io"
+	"os"
 	"time"
 
 	"github.com/restic/restic/internal/errors"
@@ -18,10 +20,13 @@ and the auto-completion files for bash, fish and zsh).
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
 `,
 	DisableAutoGenTag: true,
-	RunE:              runGenerate,
+	RunE: func(_ *cobra.Command, args []string) error {
+		return runGenerate(genOpts, args)
+	},
 }
 
 type generateOptions struct {
@@ -38,10 +43,10 @@ func init() {
 	cmdRoot.AddCommand(cmdGenerate)
 	fs := cmdGenerate.Flags()
 	fs.StringVar(&genOpts.ManDir, "man", "", "write man pages to `directory`")
-	fs.StringVar(&genOpts.BashCompletionFile, "bash-completion", "", "write bash completion `file`")
-	fs.StringVar(&genOpts.FishCompletionFile, "fish-completion", "", "write fish completion `file`")
-	fs.StringVar(&genOpts.ZSHCompletionFile, "zsh-completion", "", "write zsh completion `file`")
-	fs.StringVar(&genOpts.PowerShellCompletionFile, "powershell-completion", "", "write powershell completion `file`")
+	fs.StringVar(&genOpts.BashCompletionFile, "bash-completion", "", "write bash completion `file` (`-` for stdout)")
+	fs.StringVar(&genOpts.FishCompletionFile, "fish-completion", "", "write fish completion `file` (`-` for stdout)")
+	fs.StringVar(&genOpts.ZSHCompletionFile, "zsh-completion", "", "write zsh completion `file` (`-` for stdout)")
+	fs.StringVar(&genOpts.PowerShellCompletionFile, "powershell-completion", "", "write powershell completion `file` (`-` for stdout)")
 }
 
 func writeManpages(dir string) error {
@@ -62,76 +67,93 @@ func writeManpages(dir string) error {
 	return doc.GenManTree(cmdRoot, header, dir)
 }
 
-func writeBashCompletion(file string) error {
+func writeCompletion(filename string, shell string, generate func(w io.Writer) error) (err error) {
 	if stdoutIsTerminal() {
-		Verbosef("writing bash completion file to %v\n", file)
+		Verbosef("writing %s completion file to %v\n", shell, filename)
 	}
-	return cmdRoot.GenBashCompletionFile(file)
+	var outWriter io.Writer
+	if filename != "-" {
+		var outFile *os.File
+		outFile, err = os.Create(filename)
+		if err != nil {
+			return
+		}
+		defer func() { err = outFile.Close() }()
+		outWriter = outFile
+	} else {
+		outWriter = globalOptions.stdout
+	}
+
+	err = generate(outWriter)
+	return
 }
 
-func writeFishCompletion(file string) error {
-	if stdoutIsTerminal() {
-		Verbosef("writing fish completion file to %v\n", file)
+func checkStdoutForSingleShell(opts generateOptions) error {
+	completionFileOpts := []string{
+		opts.BashCompletionFile,
+		opts.FishCompletionFile,
+		opts.ZSHCompletionFile,
+		opts.PowerShellCompletionFile,
 	}
-	return cmdRoot.GenFishCompletionFile(file, true)
+	seenIsStdout := false
+	for _, completionFileOpt := range completionFileOpts {
+		if completionFileOpt == "-" {
+			if seenIsStdout {
+				return errors.Fatal("the generate command can generate shell completions to stdout for single shell only")
+			}
+			seenIsStdout = true
+		}
+	}
+	return nil
 }
 
-func writeZSHCompletion(file string) error {
-	if stdoutIsTerminal() {
-		Verbosef("writing zsh completion file to %v\n", file)
-	}
-	return cmdRoot.GenZshCompletionFile(file)
-}
-
-func writePowerShellCompletion(file string) error {
-	if stdoutIsTerminal() {
-		Verbosef("writing powershell completion file to %v\n", file)
-	}
-	return cmdRoot.GenPowerShellCompletionFile(file)
-}
-
-func runGenerate(_ *cobra.Command, args []string) error {
+func runGenerate(opts generateOptions, args []string) error {
 	if len(args) > 0 {
 		return errors.Fatal("the generate command expects no arguments, only options - please see `restic help generate` for usage and flags")
 	}
 
-	if genOpts.ManDir != "" {
-		err := writeManpages(genOpts.ManDir)
+	if opts.ManDir != "" {
+		err := writeManpages(opts.ManDir)
 		if err != nil {
 			return err
 		}
 	}
 
-	if genOpts.BashCompletionFile != "" {
-		err := writeBashCompletion(genOpts.BashCompletionFile)
+	err := checkStdoutForSingleShell(opts)
+	if err != nil {
+		return err
+	}
+
+	if opts.BashCompletionFile != "" {
+		err := writeCompletion(opts.BashCompletionFile, "bash", cmdRoot.GenBashCompletion)
 		if err != nil {
 			return err
 		}
 	}
 
-	if genOpts.FishCompletionFile != "" {
-		err := writeFishCompletion(genOpts.FishCompletionFile)
+	if opts.FishCompletionFile != "" {
+		err := writeCompletion(opts.FishCompletionFile, "fish", func(w io.Writer) error { return cmdRoot.GenFishCompletion(w, true) })
 		if err != nil {
 			return err
 		}
 	}
 
-	if genOpts.ZSHCompletionFile != "" {
-		err := writeZSHCompletion(genOpts.ZSHCompletionFile)
+	if opts.ZSHCompletionFile != "" {
+		err := writeCompletion(opts.ZSHCompletionFile, "zsh", cmdRoot.GenZshCompletion)
 		if err != nil {
 			return err
 		}
 	}
 
-	if genOpts.PowerShellCompletionFile != "" {
-		err := writePowerShellCompletion(genOpts.PowerShellCompletionFile)
+	if opts.PowerShellCompletionFile != "" {
+		err := writeCompletion(opts.PowerShellCompletionFile, "powershell", cmdRoot.GenPowerShellCompletion)
 		if err != nil {
 			return err
 		}
 	}
 
 	var empty generateOptions
-	if genOpts == empty {
+	if opts == empty {
 		return errors.Fatal("nothing to do, please specify at least one output file/dir")
 	}
 

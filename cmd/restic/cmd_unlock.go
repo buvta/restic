@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 
-	"github.com/restic/restic/internal/restic"
+	"github.com/restic/restic/internal/repository"
 	"github.com/spf13/cobra"
 )
 
@@ -16,10 +16,12 @@ The "unlock" command removes stale locks that have been created by other restic 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
 `,
+	GroupID:           cmdGroupDefault,
 	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
+	RunE: func(cmd *cobra.Command, _ []string) error {
 		return runUnlock(cmd.Context(), unlockOptions, globalOptions)
 	},
 }
@@ -43,9 +45,9 @@ func runUnlock(ctx context.Context, opts UnlockOptions, gopts GlobalOptions) err
 		return err
 	}
 
-	fn := restic.RemoveStaleLocks
+	fn := repository.RemoveStaleLocks
 	if opts.RemoveAll {
-		fn = restic.RemoveAllLocks
+		fn = repository.RemoveAllLocks
 	}
 
 	processed, err := fn(ctx, repo)

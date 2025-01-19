@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 
@@ -168,6 +169,16 @@ type testEnvironment struct {
 	gopts                                   GlobalOptions
 }
 
+type logOutputter struct {
+	t testing.TB
+}
+
+func (l *logOutputter) Write(p []byte) (n int, err error) {
+	l.t.Helper()
+	l.t.Log(strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
 // withTestEnvironment creates a test environment and returns a cleanup
 // function which removes it.
 func withTestEnvironment(t testing.TB) (env *testEnvironment, cleanup func()) {
@@ -200,8 +211,11 @@ func withTestEnvironment(t testing.TB) (env *testEnvironment, cleanup func()) {
 		Quiet:    true,
 		CacheDir: env.cache,
 		password: rtest.TestPassword,
-		stdout:   os.Stdout,
-		stderr:   os.Stderr,
+		// stdout and stderr are written to by Warnf etc. That is the written data
+		// usually consists of one or multiple lines and therefore can be handled well
+		// by t.Log.
+		stdout:   &logOutputter{t},
+		stderr:   &logOutputter{t},
 		extended: make(options.Options),
 
 		// replace this hook with "nil" if listing a filetype more than once is necessary
@@ -232,47 +246,79 @@ func testSetupBackupData(t testing.TB, env *testEnvironment) string {
 }
 
 func listPacks(gopts GlobalOptions, t *testing.T) restic.IDSet {
-	r, err := OpenRepository(context.TODO(), gopts)
+	ctx, r, unlock, err := openWithReadLock(context.TODO(), gopts, false)
 	rtest.OK(t, err)
+	defer unlock()
 
 	packs := restic.NewIDSet()
 
-	rtest.OK(t, r.List(context.TODO(), restic.PackFile, func(id restic.ID, size int64) error {
+	rtest.OK(t, r.List(ctx, restic.PackFile, func(id restic.ID, size int64) error {
 		packs.Insert(id)
 		return nil
 	}))
 	return packs
 }
 
-func removePacks(gopts GlobalOptions, t testing.TB, remove restic.IDSet) {
-	r, err := OpenRepository(context.TODO(), gopts)
+func listTreePacks(gopts GlobalOptions, t *testing.T) restic.IDSet {
+	ctx, r, unlock, err := openWithReadLock(context.TODO(), gopts, false)
 	rtest.OK(t, err)
+	defer unlock()
+
+	rtest.OK(t, r.LoadIndex(ctx, nil))
+	treePacks := restic.NewIDSet()
+	rtest.OK(t, r.ListBlobs(ctx, func(pb restic.PackedBlob) {
+		if pb.Type == restic.TreeBlob {
+			treePacks.Insert(pb.PackID)
+		}
+	}))
+
+	return treePacks
+}
+
+func captureBackend(gopts *GlobalOptions) func() backend.Backend {
+	var be backend.Backend
+	gopts.backendTestHook = func(r backend.Backend) (backend.Backend, error) {
+		be = r
+		return r, nil
+	}
+	return func() backend.Backend {
+		return be
+	}
+}
+
+func removePacks(gopts GlobalOptions, t testing.TB, remove restic.IDSet) {
+	be := captureBackend(&gopts)
+	ctx, _, unlock, err := openWithExclusiveLock(context.TODO(), gopts, false)
+	rtest.OK(t, err)
+	defer unlock()
 
 	for id := range remove {
-		rtest.OK(t, r.Backend().Remove(context.TODO(), backend.Handle{Type: restic.PackFile, Name: id.String()}))
+		rtest.OK(t, be().Remove(ctx, backend.Handle{Type: restic.PackFile, Name: id.String()}))
 	}
 }
 
 func removePacksExcept(gopts GlobalOptions, t testing.TB, keep restic.IDSet, removeTreePacks bool) {
-	r, err := OpenRepository(context.TODO(), gopts)
+	be := captureBackend(&gopts)
+	ctx, r, unlock, err := openWithExclusiveLock(context.TODO(), gopts, false)
 	rtest.OK(t, err)
+	defer unlock()
 
 	// Get all tree packs
-	rtest.OK(t, r.LoadIndex(context.TODO(), nil))
+	rtest.OK(t, r.LoadIndex(ctx, nil))
 
 	treePacks := restic.NewIDSet()
-	r.Index().Each(context.TODO(), func(pb restic.PackedBlob) {
+	rtest.OK(t, r.ListBlobs(ctx, func(pb restic.PackedBlob) {
 		if pb.Type == restic.TreeBlob {
 			treePacks.Insert(pb.PackID)
 		}
-	})
+	}))
 
 	// remove all packs containing data blobs
-	rtest.OK(t, r.List(context.TODO(), restic.PackFile, func(id restic.ID, size int64) error {
+	rtest.OK(t, r.List(ctx, restic.PackFile, func(id restic.ID, size int64) error {
 		if treePacks.Has(id) != removeTreePacks || keep.Has(id) {
 			return nil
 		}
-		return r.Backend().Remove(context.TODO(), backend.Handle{Type: restic.PackFile, Name: id.String()})
+		return be().Remove(ctx, backend.Handle{Type: restic.PackFile, Name: id.String()})
 	}))
 }
 
